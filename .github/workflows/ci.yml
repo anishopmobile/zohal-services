@@ -1,0 +1,26 @@
+name: PHP quality and smoke tests
+on:
+  push:
+  pull_request:
+jobs:
+  php:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PHP 8.3 with SQLite, cURL and Sodium
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, sqlite3, curl, sodium
+          coverage: none
+      - name: Lint all PHP files
+        run: find public src tests -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: Pure and integration tests
+        env:
+          APP_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
+        run: php tests/run.php
+      - name: HTTP smoke checks
+        env:
+          APP_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
+          APP_SETUP_KEY: 'ci-test-setup-key-only'
+        run: bash tests/http-smoke.sh
