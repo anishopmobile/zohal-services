@@ -75,32 +75,40 @@ try {
         $setupKey=getenv('APP_SETUP_KEY') ?: '';
         $user=trim((string)($_POST['username']??'')); $pass=$_POST['password']??'';
         if (strlen($setupKey)<16 || !is_string($pass) || !hash_equals($setupKey,(string)($_POST['setup_key']??'')) || !preg_match('/^[a-zA-Z0-9_]{4,32}$/D',$user) || strlen($pass)<12 || $pass!==($_POST['confirm_password']??null)) {
-            flash('کد راه‌اندازی یا اطلاعات حساب معتبر نیست. نام کاربری لاتین و رمز حداقل ۱۲ کاراکتری الزامی است.'); navigate('/admin/setup');
+            authFailed('کد راه‌اندازی یا اطلاعات حساب معتبر نیست. نام کاربری لاتین و رمز حداقل ۱۲ کاراکتری الزامی است.','/admin/setup');
         }
-        $pdo=db(); $pdo->exec('BEGIN IMMEDIATE');
+        $pdo=db();
+        $setupLock=$pdo->query("SELECT GET_LOCK('zohal_first_admin', 5)")->fetchColumn();
+        if ((int)$setupLock!==1) authFailed('ترافیک راه‌اندازی زیاد است. دوباره امتحان کنید.','/admin/setup');
         try {
-            if ((int)$pdo->query('SELECT COUNT(*) FROM admins')->fetchColumn()!==0) { $pdo->rollBack(); navigate('/admin/login'); }
+            $pdo->beginTransaction();
+            if ((int)$pdo->query('SELECT COUNT(*) FROM admins')->fetchColumn()!==0) { $pdo->rollBack(); authFailed('حساب مدیر قبلاً ساخته شده است.','/admin/login'); }
             $pdo->prepare('INSERT INTO admins(username,password_hash,created_at) VALUES (?,?,?)')->execute([$user,password_hash($pass,PASSWORD_DEFAULT),isoNow()]);
+            $adminId=(int)$pdo->lastInsertId();
             $pdo->commit();
         } catch (Throwable $x) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $x; }
-        session_regenerate_id(true); $_SESSION['admin_id']=(int)$pdo->lastInsertId(); $_SESSION['created']=time();
-        flash('حساب مدیر ساخته شد. ابتدا توکن و مسیرهای API را تنظیم کنید.'); navigate('/admin');
+        finally { $pdo->query("SELECT RELEASE_LOCK('zohal_first_admin')")->fetchColumn(); }
+        session_regenerate_id(true); $_SESSION['admin_id']=$adminId; $_SESSION['created']=time();
+        flash('حساب مدیر ساخته شد. ابتدا توکن و مسیرهای API را تنظیم کنید.'); authSucceeded('/admin');
     }
     if ($path==='/admin/login' && $method==='POST') {
         verifyCsrf();
         $user=substr(trim((string)($_POST['username']??'')),0,100); $pass=$_POST['password']??'';
         if (!is_string($pass)) $pass='';
-        if (loginRateLimited($user)) { flash('تلاش‌های ورود بیش از حد مجاز است. ۱۵ دقیقه بعد امتحان کنید.'); navigate('/admin/login'); }
+        if (loginRateLimited($user)) authFailed('تلاش‌های ورود بیش از حد مجاز است. ۱۵ دقیقه بعد امتحان کنید.','/admin/login');
         $q=db()->prepare('SELECT * FROM admins WHERE username=?'); $q->execute([$user]); $admin=$q->fetch();
         if (!$admin || !password_verify($pass,$admin['password_hash'])) {
             db()->prepare('INSERT INTO login_attempts(username,ip_hash,created_at) VALUES (?,?,?)')->execute([$user,ipHash(),isoNow()]);
-            flash('نام کاربری یا رمز عبور اشتباه است.'); navigate('/admin/login');
+            authFailed('نام کاربری یا رمز عبور اشتباه است.','/admin/login');
         }
         db()->prepare('DELETE FROM login_attempts WHERE username=? OR ip_hash=?')->execute([$user,ipHash()]);
-        session_regenerate_id(true); $_SESSION['admin_id']=$admin['id']; $_SESSION['created']=time(); navigate('/admin');
+        session_regenerate_id(true); $_SESSION['admin_id']=(int)$admin['id']; $_SESSION['created']=time();
+        if (isset($_POST['remember_me'])) { revokeRememberToken(); issueRememberToken((int)$admin['id']); }
+        else { revokeRememberToken(); }
+        authSucceeded('/admin');
     }
     if ($path==='/admin/logout' && $method==='POST') {
-        verifyCsrf(); $_SESSION=[]; session_destroy(); navigate('/admin/login');
+        verifyCsrf(); revokeRememberToken(); $_SESSION=[]; session_destroy(); navigate('/admin/login');
     }
     if ($path==='/admin/settings' && $method==='POST') {
         requireAdmin(); verifyCsrf();
@@ -127,7 +135,7 @@ try {
     }
     if ($path==='/admin' && $method==='GET') {
         if (!isAdmin()) navigate('/admin/login');
-        $services=db()->query('SELECT * FROM services ORDER BY rowid')->fetchAll();
+        $services=db()->query('SELECT * FROM services ORDER BY slug')->fetchAll();
         $counts=[];
         foreach(db()->query("SELECT service_slug,COUNT(*) AS total,SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS succeeded FROM inquiries GROUP BY service_slug") as $r) $counts[$r['service_slug']]=$r;
         $recent=db()->query('SELECT service_slug,created_at,status,upstream_status,duration_ms FROM inquiries ORDER BY id DESC LIMIT 60')->fetchAll();
@@ -181,10 +189,20 @@ try {
         layoutStart($setup?'ساخت حساب مدیر':'ورود به مدیریت'); ?>
         <main class="auth-wrap"><div class="auth-card card shadow-lg"><div class="card-body p-4 p-md-5"><div class="auth-icon">🔐</div><div class="eyebrow">دسترسی ویژه مدیریت</div><h1 class="h2 mt-2 mb-2"><?=$setup?'راه‌اندازی مدیر اصلی':'خوش آمدید'?></h1><p class="text-secondary mb-4"><?=$setup?'این فرم تنها برای ساخت اولین مدیر در دسترس است.':'برای ورود، اطلاعات حساب مدیریت را وارد کنید.'?></p>
         <?php if($m=message()): ?><div class="alert alert-warning"><?=e($m)?></div><?php endif; ?>
-        <form method="post" action="<?=$setup?'/admin/setup':'/admin/login'?>"><input type="hidden" name="_csrf" value="<?=e(csrf())?>"><div class="mb-3"><label class="form-label">نام کاربری</label><input class="form-control ltr" name="username" dir="ltr" required minlength="4" maxlength="32" autocomplete="username"></div>
-        <div class="mb-3"><label class="form-label">رمز عبور</label><input class="form-control ltr" name="password" type="password" required <?=$setup?'minlength="12"':''?> autocomplete="<?=$setup?'new-password':'current-password'?>"></div>
-        <?php if ($setup): ?><div class="mb-3"><label class="form-label">تکرار رمز عبور</label><input class="form-control ltr" name="confirm_password" type="password" required minlength="12" autocomplete="new-password"></div><div class="mb-3"><label class="form-label">کلید راه‌اندازی (APP_SETUP_KEY)</label><input class="form-control ltr" name="setup_key" type="password" required autocomplete="off"></div><?php endif; ?>
-        <button type="submit" class="btn btn-primary w-100 btn-lg"><?=$setup?'ایجاد حساب مدیریت':'ورود امن'?></button></form>
+        <?php $oldUsername=(string)($_SESSION['old_username']??''); unset($_SESSION['old_username']); $oldRemember=(bool)($_SESSION['old_remember']??false); unset($_SESSION['old_remember']); ?>
+        <form method="post" id="auth-form" data-auth-form action="<?=$setup?'/admin/setup':'/admin/login'?>" novalidate>
+          <input type="hidden" name="_csrf" value="<?=e(csrf())?>">
+          <div class="alert alert-danger" id="auth-error" role="alert" aria-live="polite" hidden></div>
+          <div class="mb-3"><label class="form-label" for="auth-username">نام کاربری</label><input id="auth-username" class="form-control ltr" name="username" dir="ltr" required minlength="4" maxlength="32" autocomplete="username" value="<?=e($oldUsername)?>"></div>
+          <div class="mb-3"><label class="form-label" for="auth-password">رمز عبور</label><input id="auth-password" class="form-control ltr" name="password" type="password" required minlength="12" autocomplete="<?=$setup?'new-password':'current-password'?>" aria-describedby="password-feedback"><div id="password-feedback" class="form-text" aria-live="polite">رمز عبور باید حداقل ۱۲ کاراکتر باشد.</div></div>
+          <?php if ($setup): ?>
+          <div class="mb-3"><label class="form-label" for="auth-confirm">تکرار رمز عبور</label><input id="auth-confirm" class="form-control ltr" name="confirm_password" type="password" required minlength="12" autocomplete="new-password" aria-describedby="confirm-feedback"><div id="confirm-feedback" class="form-text" aria-live="polite"></div></div>
+          <div class="mb-3"><label class="form-label" for="auth-setup-key">کلید راه‌اندازی (APP_SETUP_KEY)</label><input id="auth-setup-key" class="form-control ltr" name="setup_key" type="password" required autocomplete="off"></div>
+          <?php else: ?>
+          <label class="form-check mb-3"><input class="form-check-input" type="checkbox" name="remember_me" value="1" <?=$oldRemember?'checked':''?>><span class="form-check-label">به خاطر سپردن ورود (۳۰ روز)</span></label>
+          <?php endif; ?>
+          <button type="submit" class="btn btn-primary w-100 btn-lg" id="auth-submit"><?=$setup?'ایجاد حساب مدیریت':'ورود امن'?></button>
+        </form>
         <div class="mt-4 text-center"><a href="/">بازگشت به سایت</a><?php if (!$setup&&!hasAdmin()): ?> · <a href="/admin/setup">ساخت اولین مدیر</a><?php endif; ?></div></div></div></main>
         <?php layoutEnd(); exit;
     }
@@ -207,7 +225,7 @@ try {
     <script type="application/json" id="catalog-json"><?=json_encode(catalog(),JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_THROW_ON_ERROR)?></script>
     <?php layoutEnd(); exit;
 } catch (Throwable $error) {
-    error_log('[app] '.get_class($error).' in '.$error->getFile().':'.$error->getLine());
+    error_log('[app] '.get_class($error).' in '.$error->getFile().':'.$error->getLine().' '.$error->getMessage());
     if (str_starts_with($path,'/api/')) sendJson(['ok'=>false,'message'=>'خطای داخلی سرویس.'],500);
     errorPage('خطای پیکربندی','در اجرای سامانه مشکلی رخ داده است. تنظیمات سرور و پایگاه داده را بررسی کنید.',500);
 }

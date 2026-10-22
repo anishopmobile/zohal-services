@@ -1,57 +1,56 @@
-# استعلام‌یار | Zohal Services
+# استعلام‌یار | Zohal Services — PHP + MySQL
 
-A Persian RTL responsive inquiry portal built with **PHP 8.2+**, **Tabler**, HTML, CSS, JavaScript and `fetch` AJAX. Nine service definitions are available. No end-user accounts, payments, or access to admin metrics. Admin-only first-time setup, token encryption, toggles, logs and Jalali reports are included.
+Persian RTL inquiry portal with Tabler. Nine catalog services and a private administrative area, AJAX forms and a 30-day optional remember-me login.
 
-## Status and documentation caveat
+## Install on cPanel (main domain, no `/public` in URL)
 
-**Provider-specific integration is deliberately fail-closed.** Zohal's `/documents` public page does not expose the individual endpoint HTTP methods, request field names, authentication format, or response schemas in the accessible page text. None of those are guessed. All nine services appear in the catalog but require verified provider endpoint paths and parameter mappings before public use. The upstream base URL/header/prefix are environment settings only. Until the integration contract is independently confirmed using a real test token, **do not claim any live lookup has been validated**.
+**Downloads:** The two version-matched archives are **committed under `dist/`** so they can be downloaded directly from this repository. Every GitHub Actions run also builds and publishes the same source-consistent archives under its Artifacts section (`zohal-cpanel-<commit-sha>`). They are created by `python3 scripts/build_cpanel.py`.
 
-Official sources: https://zohal.io/api and https://zohal.io/documents.
+1. Use PHP **8.2+** with `pdo_mysql`, `curl`, `sodium`, and `openssl`. Enable HTTPS and connect the domain to the cPanel hosting server. Create a **MySQL database** and dedicated **MySQL user** in cPanel → MySQL Databases; assign the user **ALL PRIVILEGES** for that database. The database must exist before first use.
+2. In cPanel File Manager, go to the home directory (the parent of `public_html`). Extract `zohal-cpanel-private.zip` there. It must create `~/zohal-services/src/app.php` and `~/zohal-services/.env.example` (NOT inside `public_html`).
+3. Extract `zohal-cpanel-public_html.zip` directly inside `~/public_html` with `index.php`, `.htaccess` and `assets/`. The deployment `index.php` requires the private app through `../zohal-services/public/index.php`; the private package contains this original public PHP entrypoint. **Do not expose the project root or `.env` under the web document root.**
+4. Copy `~/zohal-services/.env.example` to `~/zohal-services/.env`. Generate APP_KEY (32 random bytes / **64 hex characters**) and APP_SETUP_KEY (min 16 random characters) independently:
+   ```bash
+   php -r 'echo bin2hex(random_bytes(32)), PHP_EOL;'
+   php -r 'echo bin2hex(random_bytes(24)), PHP_EOL;'
+   ```
+   Enter the generated values, plus **DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD** from cPanel. Prefix database/user names with the cPanel account prefix exactly as shown in MySQL Databases. Passwords containing `#` or `=` should be enclosed in double quotes in `.env`.
+5. Set file permissions to keep `.env` private (e.g. `chmod 600 ~/zohal-services/.env`) and ensure PHP can read `src` and write required session data. MySQL tables are created automatically on the first request. Visit `https://YOUR-DOMAIN/admin/setup` to create the first administrator with APP_SETUP_KEY; then use `/admin/login`.
+6. The application **does not need MySQL imports** on a fresh install. Existing SQLite data is **not automatically migrated**. If you need to preserve SQLite records, back them up and migrate them separately *before switching production*.
 
-## Requirements
+### Troubleshooting “خطای پیکربندی”
 
-- PHP >= 8.2 with `pdo_sqlite`, `sqlite3` (underlying SQLite), `curl`, `sodium`, `openssl`, `mbstring` optional.
-- HTTPS in production; web document root **MUST** be `public/`, never project root.
-- Writable project `storage/` directory, not served publicly. Shared PHP process must have filesystem permissions.
-- CSS/JS of Tabler are CDN-loaded; self-host pinned assets in environments with restrictive CSP/no CDN access. The frontend uses the Tabler RTL stylesheet version 1.6.1.
+Usually indicates incorrect MySQL credentials, missing `pdo_mysql`, malformed `APP_KEY`, missing database grants, or wrong split-host layout. Check cPanel → MultiPHP Manager, Select PHP Version/Extensions and the PHP **error log** (no DB credentials are displayed to visitors). `APP_SETUP_KEY` alone does not establish database connectivity. Verify the files are at `~/zohal-services/src/app.php`, `~/zohal-services/public/index.php`, and `~/public_html/index.php`.
 
-## Setup
+### Development server
 
-```sh
+```bash
 cp .env.example .env
-php -r 'echo bin2hex(random_bytes(32)),PHP_EOL;'
-php -r 'echo bin2hex(random_bytes(24)),PHP_EOL;'
-# Paste the first into APP_KEY and the second into APP_SETUP_KEY.
-# Verify ZOHAL_API_BASE_URL, ZOHAL_AUTH_HEADER, ZOHAL_AUTH_PREFIX from official docs.
-mkdir -p storage && chmod 700 storage
+# Configure DB_* and secure APP_KEY/APP_SETUP_KEY in .env.
 php -S 127.0.0.1:8080 -t public public/router.php
 ```
 
-Visit `/admin/setup` to create the only initial admin; it requires the `APP_SETUP_KEY`. After that, the registration route is permanently closed as long as that admin exists. Log in at `/admin/login`, enter the 40-character token (encrypted in SQLite with Sodium), and configure individual services. To enable a service in production:
+### Security and account behavior
 
-1. Obtain its exact path and GET/POST method in the Zohal API **documentation**, along with the real upstream field names. Configure an absolute **path only** in the admin (for example `/v1/some-service` is just a *format example*, **not** a real Zohal endpoint).
-2. Set JSON field mappings like `{"national_code":"nationalCode","mobile":"mobileNumber"}` only if the official documentation confirms those names. An empty `{}` forwards the app's internal field names unchanged.
-3. Confirm the `ZOHAL_API_BASE_URL` and `ZOHAL_AUTH_*` settings. No outbound requests are sent to arbitrary per-service hosts. External redirects, non-HTTPS URLs and TLS bypass are disabled.
-4. Validate with a provider sandbox/approved test identity and enable the service in the panel. **Do not test with another person's private data.**
+- Initial-admin-only registration (once the first administrator exists, registration is closed). Admin credentials and lookup statistics are stored in **MySQL/InnoDB**, passwords hashed using `password_hash`.
+- Failed login/registration with JavaScript keeps form fields on screen (AJAX, no reload); non-JavaScript submissions preserve the username only, not passwords or setup secrets. Password length and confirmation are checked on blur/submit without page refresh.
+- “به خاطر سپردن ورود” is optional for **30 days**, using randomly generated cookie credentials whose SHA-256 hashes alone are stored in MySQL, rotated on session restoration and revoked on logout. HTTPS is required for production use. Do not use shared computers with remember-me checked.
+- Provider token is sealed with Sodium under APP_KEY and stored in the settings table; keep **both MySQL backups and APP_KEY** safe. Inquiry logs store no entered identity/banking data and no raw IPs. Protect the MySQL account and `.env`.
+- Rate-limiting is serialized per hashed IP with MySQL GET_LOCK; CSRF, secure sessions, CSP, HTTPS upstream and server-side input validation are in place. Add WAF/monitoring for production. The app does not auto-import old SQLite databases.
 
-For a new service, add one service definition to `src/catalog.php` with a new slug and fields. The database seeds it automatically; its route and field mappings are then managed from the panel. Review/extend validation rules before deployment.
+### Provider integration
 
-## Security/privacy
+The exact Zohal HTTP paths, fields, and authentication headers are **not verified** from the accessible public documentation. The services are fail-closed until individually configured against the official contract and tested with approved credentials/test data. Do **not** treat passing unit/HTTP tests as validation of the real Zohal service.
 
-- Admin password hashes via `password_hash`, one-time setup secret, SQLite atomic setup, session rotation, HttpOnly/SameSite cookies, CSRF protection, login rate limiting, escaping and CSP.
-- Strong APP_KEY used for authenticated secretbox encryption of the provider token. **Keep .env and DB backed up securely together**; losing APP_KEY makes the token unreadable.
-- Anonymous rate limit of 5 requests/minute and 30/hour per IP (hashed, never stored in plain text). Production should add WAF/CAPTCHA, DDoS protection and application monitoring.
-- Provider receives user-entered data only on explicit consent. Inquiry log stores **no entered PII or provider response** (only service, timestamp, status, performance, keyed-IP hash). Provider response is returned only to the requester via a non-cached JSON response.
-- Data retention: inquiry log is retained until your own policy deletes it. Discuss consent, retention, and provider terms with your legal/compliance team before production use.
-- SQLite performs well for modest traffic; migrate to PostgreSQL/MySQL + queues for high-volume request processing.
+Sources: https://zohal.io/api and https://zohal.io/documents.
 
-## Tests
+### Tests and distributions
 
-```sh
-php -l src/app.php
-php -l src/catalog.php
-php -l public/index.php
-php tests/run.php
+```bash
+php tests/run.php  # when DB_* and APP_KEY are set, tests MySQL, security helpers and token rotation
+bash tests/http-smoke.sh
+python3 scripts/build_cpanel.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-GitHub Actions also installs required extensions, runs regression tests, starts the PHP dev server and checks HTTP paths, CSRF and first-admin setup. Provider live calls are intentionally not part of CI (no real token/contract). **A passing CI job is not a penetration test or proof that live Zohal endpoints work.**
+GitHub Actions runs `php -l`, MySQL 8 integration, HTTP smoke tests, ZIP consistency checks and uploads host-ready ZIP archives as workflow artifacts on every push. Both ready-to-install ZIPs are included in the same Git commit under `dist/`; the workflow validates their internal files against the source snapshot.

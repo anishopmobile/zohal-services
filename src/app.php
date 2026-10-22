@@ -24,20 +24,68 @@ function db(): PDO {
     static $pdo;
     if ($pdo instanceof PDO) return $pdo;
     appKey();
-    if (!extension_loaded('pdo_sqlite')) throw new RuntimeException('pdo_sqlite extension is required.');
-    if (!is_dir(dirname(DB_PATH))) mkdir(dirname(DB_PATH), 0700, true);
-    $pdo = new PDO('sqlite:'.DB_PATH, null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES=>false]);
-    $pdo->exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
-    $pdo->exec('CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)');
-    $pdo->exec('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-    $pdo->exec('CREATE TABLE IF NOT EXISTS services (slug TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, endpoint TEXT NOT NULL DEFAULT \'\', method TEXT NOT NULL DEFAULT \'POST\', field_map TEXT NOT NULL DEFAULT \'{}\')');
-    $pdo->exec('CREATE TABLE IF NOT EXISTS inquiries (id INTEGER PRIMARY KEY AUTOINCREMENT, service_slug TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL, upstream_status INTEGER, duration_ms INTEGER, ip_hash TEXT NOT NULL)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_inquiries_created ON inquiries(created_at)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_inquiries_rate ON inquiries(ip_hash, created_at)');
-    $pdo->exec('CREATE TABLE IF NOT EXISTS login_attempts (id INTEGER PRIMARY KEY, username TEXT NOT NULL, ip_hash TEXT NOT NULL, created_at TEXT NOT NULL)');
-    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_login_attempts_created ON login_attempts(created_at)');
+    if (!extension_loaded('pdo_mysql')) throw new RuntimeException('pdo_mysql extension is required.');
+    $host=getenv('DB_HOST') ?: '127.0.0.1';
+    $port=getenv('DB_PORT') ?: '3306';
+    $name=getenv('DB_NAME') ?: '';
+    $user=getenv('DB_USER') ?: '';
+    $pass=getenv('DB_PASSWORD');
+    if (!preg_match('/^[a-zA-Z0-9._-]{1,253}$/D',$host) || !ctype_digit($port) || (int)$port<1 || (int)$port>65535 ||
+        !preg_match('/^[a-zA-Z0-9_]{1,64}$/D',$name) || $user==='' || $pass===false) {
+        throw new RuntimeException('Missing or invalid MySQL database environment settings.');
+    }
+    $dsn="mysql:host=$host;port=$port;dbname=$name;charset=utf8mb4";
+    $pdo=new PDO($dsn,$user,$pass,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC, PDO::ATTR_EMULATE_PREPARES=>false,
+        PDO::ATTR_TIMEOUT=>5]);
+    $pdo->exec("SET time_zone = '+00:00'");
+    // Schema creation is idempotent. The MySQL database and user must already exist.
+    $pdo->exec('CREATE TABLE IF NOT EXISTS admins (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(32) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        created_at CHAR(20) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS settings (
+        `key` VARCHAR(100) NOT NULL PRIMARY KEY,
+        `value` TEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS services (
+        slug VARCHAR(64) NOT NULL PRIMARY KEY,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        endpoint VARCHAR(191) NOT NULL DEFAULT '',
+        method VARCHAR(8) NOT NULL DEFAULT 'POST',
+        field_map TEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec('CREATE TABLE IF NOT EXISTS inquiries (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        service_slug VARCHAR(64) NOT NULL,
+        created_at CHAR(20) NOT NULL,
+        status VARCHAR(32) NOT NULL,
+        upstream_status SMALLINT UNSIGNED NULL,
+        duration_ms INT UNSIGNED NULL,
+        ip_hash CHAR(64) NOT NULL,
+        INDEX idx_inquiries_created (created_at),
+        INDEX idx_inquiries_rate (ip_hash,created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS login_attempts (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(100) NOT NULL,
+        ip_hash CHAR(64) NOT NULL,
+        created_at CHAR(20) NOT NULL,
+        INDEX idx_login_attempts_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS remember_tokens (
+        selector CHAR(24) NOT NULL PRIMARY KEY,
+        validator_hash CHAR(64) NOT NULL,
+        admin_id BIGINT UNSIGNED NOT NULL,
+        created_at CHAR(20) NOT NULL,
+        expires_at CHAR(20) NOT NULL,
+        INDEX idx_remember_expires (expires_at),
+        CONSTRAINT fk_remember_admin FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
     foreach (array_keys(catalog()) as $slug) {
-        $pdo->prepare('INSERT OR IGNORE INTO services (slug) VALUES (?)')->execute([$slug]);
+        $pdo->prepare('INSERT IGNORE INTO services (slug,field_map) VALUES (?,?)')->execute([$slug,'{}']);
     }
     return $pdo;
 }
@@ -65,12 +113,74 @@ function verifyCsrf(): void {
     $provided = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? $_POST['_csrf'] ?? '';
     if (!is_string($provided) || !hash_equals(csrf(), $provided)) sendJson(['ok'=>false,'message'=>'نشست یا توکن امنیتی نامعتبر است؛ صفحه را تازه کنید.'], 419);
 }
-function isAdmin(): bool { return !empty($_SESSION['admin_id']); }
+function isAdmin(): bool {
+    if (!empty($_SESSION['admin_id'])) return true;
+    return restoreRememberedAdmin();
+}
+function isHttps(): bool {
+    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (string)($_SERVER['SERVER_PORT'] ?? '') === '443';
+}
+function rememberCookie(string $value, int $expires): void {
+    setcookie('zohal_remember',$value,[
+        'expires'=>$expires, 'path'=>'/', 'secure'=>true, 'httponly'=>true, 'samesite'=>'Lax'
+    ]);
+    if ($value==='') unset($_COOKIE['zohal_remember']);
+    else $_COOKIE['zohal_remember']=$value;
+}
+function revokeRememberToken(): void {
+    $token=$_COOKIE['zohal_remember']??'';
+    if (is_string($token) && preg_match('/^([a-f0-9]{24}):[a-f0-9]{64}$/D',$token,$m)) {
+        db()->prepare('DELETE FROM remember_tokens WHERE selector=?')->execute([$m[1]]);
+    }
+    rememberCookie('',time()-3600);
+}
+function issueRememberToken(int $adminId): void {
+    $selector=bin2hex(random_bytes(12));
+    $validator=bin2hex(random_bytes(32));
+    $expiry=time()+30*86400;
+    db()->prepare('INSERT INTO remember_tokens (selector,validator_hash,admin_id,created_at,expires_at) VALUES (?,?,?,?,?)')
+        ->execute([$selector,hash('sha256',$validator),$adminId,isoNow(),gmdate('Y-m-d\TH:i:s\Z',$expiry)]);
+    rememberCookie($selector.':'.$validator,$expiry);
+}
+function restoreRememberedAdmin(): bool {
+    $token=$_COOKIE['zohal_remember']??'';
+    if (!is_string($token) || !preg_match('/^([a-f0-9]{24}):([a-f0-9]{64})$/D',$token,$matches)) return false;
+    $p=db()->prepare('SELECT r.admin_id,r.validator_hash,r.expires_at FROM remember_tokens r JOIN admins a ON a.id=r.admin_id WHERE r.selector=?');
+    $p->execute([$matches[1]]);
+    $row=$p->fetch();
+    if (!$row || $row['expires_at']<=isoNow() || !hash_equals($row['validator_hash'],hash('sha256',$matches[2]))) {
+        revokeRememberToken();
+        return false;
+    }
+    // Rotate the one-time validator on session restoration, never store plaintext in MySQL.
+    db()->prepare('DELETE FROM remember_tokens WHERE selector=?')->execute([$matches[1]]);
+    session_regenerate_id(true);
+    $_SESSION['admin_id']=(int)$row['admin_id'];
+    $_SESSION['created']=time();
+    unset($_SESSION['csrf']);
+    issueRememberToken((int)$row['admin_id']);
+    return true;
+}
+function authFailed(string $message, string $redirect, array $errors=[]): never {
+    if (str_contains((string)($_SERVER['HTTP_ACCEPT'] ?? ''),'application/json')) {
+        sendJson(['ok'=>false,'message'=>$message,'errors'=>$errors],422);
+    }
+    $_SESSION['old_username']=is_string($_POST['username']??null) ? substr(trim($_POST['username']),0,32) : '';
+    $_SESSION['old_remember']=isset($_POST['remember_me']);
+    $_SESSION['flash']=$message;
+    header('Location: '.$redirect,true,303);
+    exit;
+}
+function authSucceeded(string $redirect): never {
+    if (str_contains((string)($_SERVER['HTTP_ACCEPT'] ?? ''),'application/json')) sendJson(['ok'=>true,'redirect'=>$redirect]);
+    header('Location: '.$redirect,true,303);
+    exit;
+}
 function requireAdmin(): void { if (!isAdmin()) sendJson(['ok'=>false,'message'=>'دسترسی غیرمجاز'], 401); }
 function setting(string $key): ?string {
-    $s=db()->prepare('SELECT value FROM settings WHERE key=?'); $s->execute([$key]); $v=$s->fetchColumn(); return $v === false ? null : (string)$v;
+    $s=db()->prepare('SELECT `value` FROM settings WHERE `key`=?'); $s->execute([$key]); $v=$s->fetchColumn(); return $v === false ? null : (string)$v;
 }
-function storeSetting(string $key,string $value): void { db()->prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')->execute([$key,$value]); }
+function storeSetting(string $key,string $value): void { db()->prepare('INSERT INTO settings (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)')->execute([$key,$value]); }
 function sealSecret(string $value): string {
     $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
     return base64_encode($nonce . sodium_crypto_secretbox($value,$nonce,appKey()));
@@ -139,8 +249,13 @@ function ipHash(): string { return hash_hmac('sha256', $_SERVER['REMOTE_ADDR'] ?
 function isoNow(): string { return gmdate('Y-m-d\TH:i:s\Z'); }
 function rateLimit(string $slug): bool {
     $pdo=db(); $now=time();
-    $pdo->exec('BEGIN IMMEDIATE');
+    // Serialize submissions from the same address to enforce the hourly/minute limits.
+    $lockName='inquiry:'.substr(ipHash(),0,40);
+    $lock=$pdo->prepare('SELECT GET_LOCK(?, 5)');
+    $lock->execute([$lockName]);
+    if ((int)$lock->fetchColumn()!==1) return false;
     try {
+        $pdo->beginTransaction();
         $p=$pdo->prepare('SELECT COUNT(*) FROM inquiries WHERE ip_hash=? AND created_at>=?');
         $p->execute([ipHash(),gmdate('Y-m-d\TH:i:s\Z',$now-60)]);
         $minute=(int)$p->fetchColumn();
@@ -148,11 +263,11 @@ function rateLimit(string $slug): bool {
         $hour=(int)$p->fetchColumn();
         if ($minute>=5 || $hour>=30) { $pdo->commit(); return false; }
         $pdo->prepare('INSERT INTO inquiries(service_slug,created_at,status,ip_hash) VALUES (?,?,?,?)')->execute([$slug,isoNow(),'pending',ipHash()]);
-        $id=(int)$pdo->lastInsertId();
+        $_SERVER['INQUIRY_ID']=(int)$pdo->lastInsertId();
         $pdo->commit();
-        $_SERVER['INQUIRY_ID']=$id;
         return true;
     } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
+    finally { $pdo->prepare('SELECT RELEASE_LOCK(?)')->execute([$lockName]); }
 }
 function finishInquiry(string $status, ?int $upstreamStatus, int $duration): void {
     db()->prepare('UPDATE inquiries SET status=?, upstream_status=?, duration_ms=? WHERE id=?')->execute([$status,$upstreamStatus,$duration,(int)($_SERVER['INQUIRY_ID']??0)]);

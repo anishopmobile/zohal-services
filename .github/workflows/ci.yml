@@ -1,26 +1,54 @@
-name: PHP quality and smoke tests
+name: PHP quality, MySQL integration and hosting artifacts
 on:
   push:
   pull_request:
 jobs:
   php:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root_test_password
+          MYSQL_DATABASE: zohal_ci
+          MYSQL_USER: zohal_ci
+          MYSQL_PASSWORD: integration_test_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot_test_password"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_NAME: zohal_ci
+      DB_USER: zohal_ci
+      DB_PASSWORD: integration_test_password
+      APP_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
+      APP_SETUP_KEY: ci-test-setup-key-only
     steps:
       - uses: actions/checkout@v4
-      - name: PHP 8.3 with SQLite, cURL and Sodium
+      - name: PHP 8.3 with MySQL, cURL and Sodium
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          extensions: pdo_sqlite, sqlite3, curl, sodium
+          extensions: pdo_mysql, curl, sodium
           coverage: none
+      - name: Syntax check JavaScript
+        run: node --check public/assets/app.js
       - name: Lint all PHP files
-        run: find public src tests -name '*.php' -print0 | xargs -0 -n1 php -l
-      - name: Pure and integration tests
-        env:
-          APP_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
+        run: find public src tests hosting -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: PHP validation and MySQL integration
         run: php tests/run.php
       - name: HTTP smoke checks
-        env:
-          APP_KEY: '1111111111111111111111111111111111111111111111111111111111111111'
-          APP_SETUP_KEY: 'ci-test-setup-key-only'
         run: bash tests/http-smoke.sh
+      - name: Build cPanel release ZIPs from this exact commit
+        run: python3 scripts/build_cpanel.py
+      - name: Validate deployment packages
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Publish downloadable cPanel ZIPs for every commit
+        uses: actions/upload-artifact@v4
+        with:
+          name: zohal-cpanel-${{ github.sha }}
+          path: dist/*.zip
+          if-no-files-found: error

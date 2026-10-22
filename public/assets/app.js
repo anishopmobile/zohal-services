@@ -24,6 +24,59 @@
     });
   });
   const modalEl = $('#inquiry-modal');
+  const auth = $('#auth-form');
+  if (auth) {
+    const password = $('#auth-password');
+    const confirm = $('#auth-confirm');
+    const error = $('#auth-error');
+    const checkPassword = () => {
+      const tooShort = password.value.length > 0 && password.value.length < 12;
+      password.classList.toggle('is-invalid', tooShort);
+      const hint = $('#password-feedback');
+      hint.classList.toggle('text-danger', tooShort);
+      hint.textContent = tooShort ? 'رمز عبور باید حداقل ۱۲ کاراکتر باشد.' : 'رمز عبور باید حداقل ۱۲ کاراکتر باشد.';
+      return !tooShort;
+    };
+    const checkConfirm = () => {
+      if (!confirm) return true;
+      const mismatch = confirm.value.length > 0 && confirm.value !== password.value;
+      confirm.classList.toggle('is-invalid', mismatch);
+      $('#confirm-feedback').textContent = mismatch ? 'تکرار رمز عبور با رمز عبور مطابقت ندارد.' : '';
+      $('#confirm-feedback').classList.toggle('text-danger', mismatch);
+      return !mismatch;
+    };
+    password.addEventListener('blur', checkPassword);
+    password.addEventListener('input', () => {
+      if (password.classList.contains('is-invalid')) checkPassword();
+      if (confirm?.value) checkConfirm();
+    });
+    confirm?.addEventListener('blur', checkConfirm);
+    confirm?.addEventListener('input', checkConfirm);
+    auth.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      if (!checkPassword() || !checkConfirm() || !auth.checkValidity()) {
+        error.textContent = 'لطفاً اطلاعات فرم را بررسی کنید. رمز عبور باید حداقل ۱۲ کاراکتر باشد.';
+        error.hidden = false;
+        return;
+      }
+      const submit = $('#auth-submit');
+      submit.disabled = true;
+      try {
+        const response = await fetch(auth.action, {
+          method: 'POST', body: new FormData(auth), credentials: 'same-origin',
+          headers: { Accept: 'application/json' }
+        });
+        const data = await response.json();
+        if (response.ok && data.ok && data.redirect) { window.location.assign(data.redirect); return; }
+        error.textContent = data.message || 'اطلاعات واردشده معتبر نیست.';
+        error.hidden = false;
+      } catch (_) {
+        error.textContent = 'ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید.';
+        error.hidden = false;
+      } finally { submit.disabled = false; }
+    });
+  }
   if (!modalEl) return;
   const catalog = JSON.parse($('#catalog-json').textContent);
   const form = $('#inquiry-form');
